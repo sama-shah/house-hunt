@@ -1,0 +1,9 @@
+# Firebase config contains your API key — never commit this
+firebase-config.js
+
+# macOS
+.DS_Store
+
+# Editor
+.clicky-preview.log
+.clicky-preview.pid

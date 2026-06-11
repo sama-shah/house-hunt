@@ -1,0 +1,29 @@
+// Paste these rules into:
+// Firebase Console → Firestore Database → Rules → Edit rules → Publish
+//
+// What these rules do:
+//   - Allow read/write ONLY to the "groups" collection (your data lives here)
+//   - Validate that writes only contain expected fields (blocks junk writes)
+//   - Deny all access to every other path in your database
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    match /groups/{groupId} {
+      // Anyone who knows the group code (document ID) can read the group.
+      allow read: if true;
+
+      // Writes must only contain the expected top-level fields.
+      allow write: if request.resource.data.keys().hasAll(['listings'])
+        && request.resource.data.keys().hasOnly(['listings', 'customLocations', 'updatedAt', 'createdAt'])
+        && request.resource.data.listings is list
+        && request.resource.data.listings.size() <= 500;
+    }
+
+    // Deny everything else in the database
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
