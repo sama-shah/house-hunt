@@ -21,6 +21,7 @@ const LOC_TYPES = {
 let session = null;
 let listings = [];
 let customLocations = [];
+let groupCreatedAt = null;
 let unsubscribe = null;
 let groupMap = null;
 const groupMapMarkers = {};  // id → { marker, lat, lng }
@@ -79,6 +80,7 @@ function subscribeToGroup(code) {
     }
     listings = snap.data().listings || [];
     customLocations = snap.data().customLocations || [];
+    groupCreatedAt = snap.data().createdAt?.toDate?.() || null;
     if (!state.editing && !inlineEdit.field) render();
   }, err => console.error("Firestore listener error:", err));
 }
@@ -204,6 +206,38 @@ function visibleListings() {
     });
 }
 
+// ── Menu dropdown ─────────────────────────────────────────────────────────────
+
+function menuDropdown() {
+  const active = activeListings();
+  const toured = listings.filter(i => i.hasTour && i.tourDate && i.status !== "archive");
+  const archived = archivedListings();
+  const lockedIn = listings.filter(i => i.status === "locked in");
+  const dateStr = groupCreatedAt
+    ? groupCreatedAt.toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" })
+    : "—";
+  return `
+    <div class="menu-section">
+      <div class="menu-group-label">Your group</div>
+      <div class="menu-group-code">${escapeHtml(session?.displayName || "")}</div>
+      <div class="menu-created">Created ${dateStr}</div>
+    </div>
+    <div class="menu-divider"></div>
+    <div class="menu-section">
+      <div class="menu-group-label">Progress</div>
+      <div class="menu-stats">
+        <div class="menu-stat"><strong>${active.length}</strong><span>Active</span></div>
+        <div class="menu-stat"><strong>${toured.length}</strong><span>Tours</span></div>
+        <div class="menu-stat"><strong>${archived.length}</strong><span>Archived</span></div>
+        <div class="menu-stat menu-stat-locked"><strong>${lockedIn.length}</strong><span>Locked in</span></div>
+      </div>
+    </div>
+    <div class="menu-divider"></div>
+    ${session?.code === "sf-roomies" ? `<button class="menu-item" data-action="reset">Reset data</button>` : ""}
+    <button class="menu-item menu-item-danger" data-action="logout">Log out</button>
+  `;
+}
+
 // ── App render ────────────────────────────────────────────────────────────────
 
 function render() {
@@ -220,13 +254,16 @@ function render() {
   app.innerHTML = `
     <div class="app-shell">
       <header class="top-bar">
-        <div class="brand">SF House Hunt</div>
-        <div class="top-actions">
-          <span class="group-badge" title="Your group code">${escapeHtml(session.displayName)}</span>
-          <button class="btn-primary" data-action="new">+ Add listing</button>
-          ${session.code === "sf-roomies" ? `<button class="btn-ghost" data-action="reset">Reset data</button>` : ""}
-          <button class="btn-ghost btn-logout" data-action="logout">Log out</button>
+        <div class="top-left">
+          <div class="nav-menu">
+            <button class="hamburger-btn" id="menuBtn" aria-label="Menu">
+              <span></span><span></span><span></span>
+            </button>
+            <div class="nav-dropdown" id="navDropdown">${menuDropdown()}</div>
+          </div>
+          <div class="brand">SF House Hunt</div>
         </div>
+        <button class="btn-primary" data-action="new">+ Add listing</button>
       </header>
       <div class="main-layout">
         <aside class="sidebar">
@@ -456,6 +493,9 @@ async function initGroupMap() {
   L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
     attribution: "© <a href='https://openstreetmap.org'>OpenStreetMap</a>"
   }).addTo(groupMap);
+
+  // Force Leaflet to re-measure the container after CSS grid has settled
+  requestAnimationFrame(() => { if (groupMap) groupMap.invalidateSize(); });
 
   // Custom location pins first (already have coords)
   for (const loc of customLocations) {
@@ -769,11 +809,26 @@ function bind() {
   document.querySelector("#status")?.addEventListener("change", e => { state.status = e.target.value; render(); });
   document.querySelector("#sort")?.addEventListener("change", e => { state.sort = e.target.value; render(); });
 
-  document.querySelectorAll("[data-action='new'], [data-action='reset'], [data-action='logout']").forEach(el => {
-    el.addEventListener("click", () => {
+  // Hamburger menu toggle
+  const menuBtn = document.querySelector("#menuBtn");
+  const navDropdown = document.querySelector("#navDropdown");
+  menuBtn?.addEventListener("click", e => {
+    e.stopPropagation();
+    navDropdown?.classList.toggle("open");
+  });
+  document.addEventListener("click", e => {
+    if (!navDropdown?.contains(e.target) && !menuBtn?.contains(e.target)) {
+      navDropdown?.classList.remove("open");
+    }
+  }, { once: false, capture: true });
+
+  document.querySelectorAll("[data-action]").forEach(el => {
+    el.addEventListener("click", e => {
+      e.stopPropagation();
       const a = el.dataset.action;
       if (a === "new") addNew();
       if (a === "reset") {
+        navDropdown?.classList.remove("open");
         if (confirm("Reset to seed data? This overwrites all changes for this group.")) {
           listings = structuredClone(window.SEED_LISTINGS);
           customLocations = [];
@@ -784,6 +839,7 @@ function bind() {
         }
       }
       if (a === "logout") {
+        navDropdown?.classList.remove("open");
         if (confirm("Log out? You'll need your group code to get back in.")) logout();
       }
     });
@@ -806,14 +862,32 @@ function bind() {
     if (item) { item.status = "in the running"; item.dateRemoved = ""; item.removalReason = ""; saveListings(); render(); }
   }));
 
-  // Map view events
-  document.querySelectorAll("[data-map-select]").forEach(el => el.addEventListener("click", () => {
+  // Map view events — click a sidebar listing card to focus its pin (geocode on demand if needed)
+  document.querySelectorAll("[data-map-select]").forEach(el => el.addEventListener("click", async () => {
+    if (!groupMap) return;
     const id = el.dataset.mapSelect;
-    const m = groupMapMarkers[id];
-    if (m && groupMap) {
-      groupMap.setView([m.lat, m.lng], 16);
-      m.marker.openPopup();
+    const existing = groupMapMarkers[id];
+    if (existing) {
+      groupMap.setView([existing.lat, existing.lng], 16);
+      existing.marker.openPopup();
+      return;
     }
+    // Pin not yet plotted — geocode this listing immediately
+    const item = listings.find(i => i.id === id);
+    if (!item?.address) return;
+    el.style.opacity = "0.6";
+    const coords = await geocodeAddress(item.address);
+    el.style.opacity = "";
+    if (!coords || !groupMap) return;
+    const color = STATUS_COLORS[item.status] || "#9b9b9b";
+    const marker = L.circleMarker([coords.lat, coords.lng], {
+      radius: 14, fillColor: color,
+      color: "#fff", weight: 2.5, opacity: 1, fillOpacity: 0.9
+    }).addTo(groupMap);
+    marker.bindPopup(mapPopupHTML(item), { maxWidth: 240, className: "lf-popup" });
+    groupMapMarkers[id] = { marker, lat: coords.lat, lng: coords.lng };
+    groupMap.setView([coords.lat, coords.lng], 16);
+    marker.openPopup();
   }));
 
   document.querySelector("#toggleAddLoc")?.addEventListener("click", () => {
